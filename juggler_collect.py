@@ -1,27 +1,22 @@
 """
 juggler_collect.py
-チャレンジャーB館 台データ収集スクリプト - 第一段階
-対象: ネオアイムジャグラーEX（台番号1〜16）
+チャレンジャーB館 台データ収集スクリプト v2.0
+Playwright不要・API直接取得版
 
 必要なライブラリ:
-  pip install playwright anthropic gspread oauth2client
-  playwright install chromium
+  pip install requests gspread oauth2client
 
-環境変数（.envファイルまたはGitHub Secrets）:
-  ANTHROPIC_API_KEY   : Claude APIキー
-  GOOGLE_CREDENTIALS  : GASサービスアカウントJSONの内容（文字列）
+環境変数（GitHub Secrets）:
+  GOOGLE_CREDENTIALS  : サービスアカウントJSONの内容
   SPREADSHEET_ID      : Google SheetsのID
 """
 
 import os
-import base64
 import json
 import time
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timedelta
 
-from playwright.sync_api import sync_playwright
-import anthropic
+import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -29,244 +24,200 @@ from oauth2client.service_account import ServiceAccountCredentials
 # 設定
 # ========================================
 
-# 対象機種（第一段階はネオアイムのみ）
+HALL_ID = 1403
+BASE_URL = "https://challenger.pt.teramoba2.com/n-api/rack_info"
+
+# リクエストヘッダー（ブラウザに偽装）
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://challenger.pt.teramoba2.com/",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "ja,en;q=0.9",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+# 対象機種（machine_nameはPayloadタブで確認した値）
 MACHINES = [
     {
         "name": "ネオアイムジャグラーEX",
-        "url": "https://challenger.pt.teramoba2.com/b-kan/standlist_slot/?kind_code=21&machine_name=S%EF%BE%88%EF%BD%B5%EF%BD%B1%EF%BD%B2%EF%BE%91%EF%BD%BC%EF%BE%9E%EF%BD%AC%EF%BD%B8%EF%BE%9E%EF%BE%97%EF%BD%B0EX-KK",
+        "kind_code": 21,
+        "machine_name": "S%EF%BE%88%EF%BD%B5%EF%BD%B1%EF%BD%B2%EF%BE%91%EF%BD%BC%EF%BE%9E%EF%BD%AC%EF%BD%B8%EF%BE%9E%EF%BE%97%EF%BD%B0EX-KK",
     },
+    # 動作確認後に追加
+    # {"name": "ゴーゴージャグラー3", "kind_code": 21, "machine_name": "..."},
+    # {"name": "マイジャグラーV",     "kind_code": 21, "machine_name": "..."},
 ]
 
-# 同意ページのURL
-CONSENT_URL = "https://challenger.pt.teramoba2.com/b-kan/protection_redirect"
-
-# スクショ保存先
-SCREENSHOT_DIR = Path("screenshots")
-SCREENSHOT_DIR.mkdir(exist_ok=True)
-
 # ========================================
-# Step 1: ブラウザ操作・スクショ取得
+# API取得関数
 # ========================================
 
-def take_screenshots(machines: list) -> dict:
-    """
-    各機種のページにアクセスしてスクショを撮る
-    戻り値: {機種名: スクショのバイナリ}
-    """
-    screenshots = {}
+def fetch_bb_history(machine: dict, history_day: int = 7) -> dict:
+    """日付別BB履歴を取得"""
+    url = f"{BASE_URL}/machine_bb_history"
+    params = {
+        "hall_id": HALL_ID,
+        "kind_code": machine["kind_code"],
+        "machine_name": machine["machine_name"],
+        "history_day": history_day,
+        "place": "",
+    }
+    print(f"  BB履歴取得中...")
+    resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    print(f"  → {len(data)}台分")
+    return data
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+def fetch_closed_info(rack_nos: list, history_day: int = 7) -> dict:
+    """閉店データ（回転数・詳細）を取得"""
+    url = f"{BASE_URL}/closed_info"
+    params = {
+        "hall_id": HALL_ID,
+        "rackNos": ",".join(str(n) for n in rack_nos),
+        "history_day": history_day,
+    }
+    print(f"  閉店データ取得中...")
+    resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    print(f"  → {len(data)}台分")
+    return data
+
+
+# ========================================
+# データ整形
+# ========================================
+
+def build_rows(machine_name: str, bb_history: dict, closed_info: dict, target_date: str) -> list:
+    """bb_historyとclosed_infoを結合してSheets行形式に変換"""
+    rows = []
+    date_str = datetime.strptime(target_date, "%Y-%m-%d").strftime("%Y/%m/%d")
+
+    for rack_no_str, history_list in bb_history.items():
+        rack_no = int(rack_no_str)
+
+        # 対象日のデータを検索
+        day_data = next(
+            (item for item in history_list if item.get("day") == target_date),
+            None
         )
-        page = context.new_page()
+        if day_data is None:
+            continue
 
-        # --- 同意ページを通過 ---
-        print("同意ページに移動...")
-        page.goto(CONSENT_URL, wait_until="networkidle")
-        time.sleep(2)
+        big = day_data.get("bounus 1")
+        reg = day_data.get("bounus 2")
 
-        # 「同意する」ボタンをクリック
-        try:
-            page.click("text=同意する")
-            print("同意ボタンをクリックしました")
-            time.sleep(2)
-        except Exception as e:
-            print(f"同意ボタンが見つかりません（既に同意済みの可能性）: {e}")
+        # BIG・REGどちらもnullなら営業中または非稼働
+        if big is None and reg is None:
+            continue
 
-        # --- 各機種ページをスクショ ---
-        for machine in machines:
-            name = machine["name"]
-            url = machine["url"]
-            print(f"\n{name} のページに移動中...")
+        # closed_infoから回転数を取得
+        # ※実際のフィールド名はclosed_infoのResponseを見て調整が必要
+        games = ""
+        rack_closed = closed_info.get(str(rack_no), [])
+        for c in rack_closed:
+            if c.get("day") == target_date:
+                games = (
+                    c.get("total_games")
+                    or c.get("start")
+                    or c.get("games")
+                    or c.get("total")
+                    or ""
+                )
+                break
 
-            page.goto(url, wait_until="networkidle")
-            time.sleep(3)  # データ読み込み待機
+        rows.append([
+            date_str,     # A: 日付
+            rack_no,      # B: 台番号
+            machine_name, # C: 機種名
+            "",           # D: 島番号（masterシートから参照）
+            big or 0,     # E: BIG
+            reg or 0,     # F: REG
+            games,        # G: 総回転数
+        ])
 
-            # ページ全体が見えるようにズームアウト
-            page.evaluate("document.body.style.zoom = '75%'")
-            time.sleep(1)
+    rows.sort(key=lambda r: r[1])  # 台番号順にソート
+    return rows
 
-            # フルページスクショ
-            screenshot_path = SCREENSHOT_DIR / f"{name}_{datetime.now().strftime('%Y%m%d')}.png"
-            page.screenshot(path=str(screenshot_path), full_page=True)
-
-            with open(screenshot_path, "rb") as f:
-                screenshots[name] = f.read()
-
-            print(f"スクショ保存: {screenshot_path}")
-            time.sleep(2)  # サーバー負荷軽減
-
-        browser.close()
-
-    return screenshots
 
 # ========================================
-# Step 2: Claude APIで画像を読み取る
+# Google Sheets書き込み
 # ========================================
 
-def extract_data_from_screenshot(client: anthropic.Anthropic, machine_name: str, image_bytes: bytes) -> list:
-    """
-    スクショ画像をClaudeに渡してデータを抽出
-    戻り値: [{"台番号": 1, "BB": 5, "RB": 3, "総回転数": 3000}, ...]
-    """
-    print(f"\nClaude APIで {machine_name} のデータを読み取り中...")
-
-    image_base64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-
-    prompt = f"""この画像はパチスロホール「チャレンジャーB館」の台データ一覧ページのスクリーンショットです。
-機種名: {machine_name}
-
-表に表示されている全ての台のデータを読み取り、以下のJSON形式で返してください。
-ARTとスタートの列は不要です。
-
-{{
-  "machines": [
-    {{"台番号": 1, "BB": 5, "RB": 3, "総回転数": 3000}},
-    {{"台番号": 2, "BB": 2, "RB": 1, "総回転数": 1500}},
-    ...
-  ]
-}}
-
-注意事項:
-- 台番号・BB・RB・総回転数のみ抽出してください
-- 数値は整数で返してください
-- 読み取れない台はスキップしてください
-- JSONのみ返し、説明文は不要です"""
-
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": image_base64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ],
-            }
-        ],
-    )
-
-    # レスポンスからJSONを抽出
-    raw_text = response.content[0].text.strip()
-
-    # ```json ... ``` のフェンスを除去
-    if raw_text.startswith("```"):
-        raw_text = raw_text.split("```")[1]
-        if raw_text.startswith("json"):
-            raw_text = raw_text[4:]
-        raw_text = raw_text.strip()
-
-    data = json.loads(raw_text)
-    machines_data = data.get("machines", [])
-    print(f"  → {len(machines_data)}台分のデータを読み取りました")
-    return machines_data
-
-# ========================================
-# Step 3: Google Sheetsに書き込む
-# ========================================
-
-def write_to_sheets(all_data: list):
-    """
-    抽出したデータをraw_dataシートに書き込む
-    """
+def write_to_sheets(all_rows: list):
     print("\nGoogle Sheetsに書き込み中...")
 
-    # 認証
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     if creds_json:
         creds_dict = json.loads(creds_json)
         creds = ServiceAccountCredentials.from_json_keyfile_dict(
             creds_dict,
-            ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            ["https://spreadsheets.google.com/feeds",
+             "https://www.googleapis.com/auth/drive"]
         )
     else:
         # ローカルテスト用
         creds = ServiceAccountCredentials.from_json_keyfile_name(
             "credentials.json",
-            ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            ["https://spreadsheets.google.com/feeds",
+             "https://www.googleapis.com/auth/drive"]
         )
 
     gc = gspread.authorize(creds)
-    spreadsheet_id = os.environ.get("SPREADSHEET_ID")
-    sheet = gc.open_by_key(spreadsheet_id).worksheet("raw_data")
+    sheet = gc.open_by_key(os.environ["SPREADSHEET_ID"]).worksheet("raw_data")
+    sheet.append_rows(all_rows, value_input_option="USER_ENTERED")
+    print(f"  → {len(all_rows)}行を書き込みました")
 
-    today = datetime.now().strftime("%Y/%m/%d")
-
-    # 既存データの最終行を取得
-    existing = sheet.get_all_values()
-    last_row = len(existing) + 1
-
-    # 書き込むデータを組み立て
-    rows = []
-    for item in all_data:
-        row = [
-            today,               # A: 日付
-            item["台番号"],       # B: 台番号
-            item["機種名"],       # C: 機種名
-            "",                  # D: 島番号（空欄、masterシートから参照）
-            item["BB"],          # E: BIG
-            item["RB"],          # F: REG
-            item["総回転数"],     # G: 総回転数
-        ]
-        rows.append(row)
-
-    if rows:
-        sheet.append_rows(rows, value_input_option="USER_ENTERED")
-        print(f"  → {len(rows)}行を書き込みました（行{last_row}〜）")
-    else:
-        print("  → 書き込むデータがありませんでした")
 
 # ========================================
-# メイン処理
+# メイン
 # ========================================
 
 def main():
     print("=" * 50)
-    print("チャレンジャーB館 台データ収集")
+    print("チャレンジャーB館 台データ収集 v2.0")
     print(f"実行日時: {datetime.now().strftime('%Y/%m/%d %H:%M:%S')}")
     print("=" * 50)
 
-    # Claude APIクライアント
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY が設定されていません")
-    client = anthropic.Anthropic(api_key=api_key)
+    # 前日のデータを取得（閉店後に実行する想定）
+    target_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    print(f"対象日: {target_date}")
 
-    # Step 1: スクショ取得
-    screenshots = take_screenshots(MACHINES)
+    all_rows = []
 
-    # Step 2: データ抽出
-    all_data = []
-    for machine_name, image_bytes in screenshots.items():
+    for machine in MACHINES:
+        print(f"\n【{machine['name']}】")
         try:
-            machine_data = extract_data_from_screenshot(client, machine_name, image_bytes)
-            for item in machine_data:
-                item["機種名"] = machine_name
-            all_data.extend(machine_data)
+            bb_history = fetch_bb_history(machine)
+            if not bb_history:
+                print("  データなし、スキップ")
+                continue
+
+            rack_nos = list(bb_history.keys())
+            closed_info = fetch_closed_info(rack_nos)
+
+            rows = build_rows(machine["name"], bb_history, closed_info, target_date)
+            print(f"  → {len(rows)}行を整形")
+            all_rows.extend(rows)
+
+            time.sleep(2)  # サーバー負荷軽減
+
         except Exception as e:
-            print(f"  ERROR: {machine_name} の読み取りに失敗: {e}")
+            print(f"  ERROR: {e}")
+            import traceback
+            traceback.print_exc()
 
-    print(f"\n合計 {len(all_data)}台分のデータを抽出")
+    print(f"\n合計 {len(all_rows)}行")
 
-    # Step 3: Sheets書き込み
-    if all_data:
-        write_to_sheets(all_data)
+    if all_rows:
+        write_to_sheets(all_rows)
+    else:
+        print("書き込むデータがありません（営業中または取得失敗）")
 
     print("\n✅ 完了")
+
 
 if __name__ == "__main__":
     main()
