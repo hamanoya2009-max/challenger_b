@@ -56,16 +56,17 @@ MACHINES = [
 
 def fetch_bb_history(machine: dict, history_day: int = 7) -> dict:
     """日付別BB履歴を取得"""
-    url = f"{BASE_URL}/machine_bb_history"
-    params = {
-        "hall_id": HALL_ID,
-        "kind_code": machine["kind_code"],
-        "machine_name": machine["machine_name"],
-        "history_day": history_day,
-        "place": "",
-    }
+    # machine_nameは既にURLエンコード済みなのでparamsに渡さずURLに直接組み込む
+    url = (
+        f"{BASE_URL}/machine_bb_history"
+        f"?hall_id={HALL_ID}"
+        f"&kind_code={machine['kind_code']}"
+        f"&machine_name={machine['machine_name']}"
+        f"&history_day={history_day}"
+        f"&place="
+    )
     print(f"  BB履歴取得中...")
-    resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     print(f"  → {len(data)}台分")
