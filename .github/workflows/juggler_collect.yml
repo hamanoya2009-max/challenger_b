@@ -32,5 +32,6 @@ jobs:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CHALLENGER_COOKIE: ${{ secrets.CHALLENGER_COOKIE }}
         run: |
           python juggler_collect.py
