@@ -28,12 +28,14 @@ HALL_ID = 1403
 BASE_URL = "https://challenger.pt.teramoba2.com/n-api/rack_info"
 
 # リクエストヘッダー（ブラウザに偽装）
+_cookie = os.environ.get("CHALLENGER_COOKIE", "")
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://challenger.pt.teramoba2.com/",
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Accept-Language": "ja,en;q=0.9",
     "X-Requested-With": "XMLHttpRequest",
+    "Cookie": _cookie,
 }
 
 # 対象機種（machine_nameはPayloadタブで確認した値）
