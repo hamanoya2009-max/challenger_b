@@ -1,0 +1,54 @@
+name: ジャグラー台データ収集
+
+on:
+  # 手動実行（WebアプリのボタンからGAS経由で発火）
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: '実行元（manual / gas）'
+        required: false
+        default: 'manual'
+
+  # 自動実行したい場合はコメントアウトを外す
+  # schedule:
+  #   - cron: '0 15 * * *'  # 毎日24時（JST）に自動実行
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 依存ライブラリをインストール
+        run: |
+          pip install --upgrade pip
+          pip install playwright anthropic gspread oauth2client python-dotenv
+
+      - name: Playwright（Chromium）をインストール
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: 台データ収集スクリプトを実行
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: |
+          python juggler_collect.py
+
+      - name: スクショをアーティファクトとして保存（デバッグ用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_id }}
+          path: screenshots/
+          retention-days: 3
