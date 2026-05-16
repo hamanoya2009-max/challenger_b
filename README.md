@@ -1,1 +1,0 @@
-# challenger_b
